@@ -68,12 +68,6 @@ def main():
     print(b)
 
 
-def test2():
-    with open('3_in.txt') as f:
-        data_in = f.read()
-    
-
-
 # https://coderun.yandex.ru/problem/print-the-route-of-the-maximum-cost
 if __name__ == '__main__':
     # test()
