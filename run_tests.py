@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 try:
@@ -27,12 +28,91 @@ def load_config(task_dir):
 
 
 def _limit_memory(memory_limit_mb):
+    """Caps RLIMIT_AS of the current process only. Used as a fallback when cgroup v2
+    isn't available: a solution that spawns its own subprocesses could still exceed
+    the intended total since each process gets its own separate cap.
+    """
     limit_bytes = memory_limit_mb * 1024 * 1024
 
     def limiter():
         resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
 
     return limiter
+
+
+def _find_cgroup_root():
+    """Finds the deepest ancestor cgroup (v2) that delegates the "memory" controller
+    to its children, so a scoped cgroup can be created there to cap and measure a
+    whole process tree's memory (not just one process, unlike RLIMIT_AS). Returns
+    None if cgroup v2 / delegation isn't available (e.g. non-Linux, cgroup v1).
+    """
+    try:
+        own_cgroup = Path("/proc/self/cgroup").read_text().strip()
+    except OSError:
+        return None
+    if not own_cgroup.startswith("0::"):
+        return None
+    parts = own_cgroup[len("0::") :].strip("/").split("/")
+
+    cgroup_fs = Path("/sys/fs/cgroup")
+    best = None
+    candidate = cgroup_fs
+    for part in [None, *parts]:
+        if part:
+            candidate = candidate / part
+        try:
+            controllers = (candidate / "cgroup.subtree_control").read_text().split()
+        except OSError:
+            continue
+        if "memory" in controllers:
+            best = candidate
+    return best
+
+
+CGROUP_ROOT = _find_cgroup_root()
+
+
+class _Cgroup:
+    """A scoped cgroup v2 group for one test run: caps and measures the memory of the
+    whole process tree launched under it (parent + any subprocesses it spawns), and
+    can kill that whole tree atomically via cgroup.kill.
+    """
+
+    def __init__(self, path):
+        self.path = path
+
+    def join(self):
+        """Moves the calling process into this cgroup. Pass as a subprocess preexec_fn
+        so it runs in the child right after fork, before exec; any processes it later
+        spawns inherit cgroup membership automatically.
+        """
+        (self.path / "cgroup.procs").write_text(str(os.getpid()))
+
+    def kill(self):
+        (self.path / "cgroup.kill").write_text("1")
+
+    def peak_bytes(self):
+        return int((self.path / "memory.peak").read_text())
+
+    def close(self):
+        self.path.rmdir()
+
+
+def _make_cgroup(memory_limit_mb):
+    """Creates a fresh scoped cgroup with the given memory cap. Returns None if cgroup
+    v2 delegation isn't available or creating it fails for any reason, so callers can
+    fall back to _limit_memory.
+    """
+    if CGROUP_ROOT is None:
+        return None
+    path = CGROUP_ROOT / f"coderun-tests-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        path.mkdir()
+        (path / "memory.max").write_text(str(memory_limit_mb * 1024 * 1024))
+        (path / "memory.swap.max").write_text("0")
+    except OSError:
+        return None
+    return _Cgroup(path)
 
 
 def discover_tests(tasks_dir=TASKS_DIR):
@@ -58,10 +138,13 @@ def discover_tests(tasks_dir=TASKS_DIR):
     return tasks
 
 
-def _run_posix(cmd, stdin, time_limit_s, preexec_fn):
-    """Runs cmd, polling with os.wait4 so we get this process's own peak RSS
-    (resource.getrusage(RUSAGE_CHILDREN) would report a running max across all
-    children, not this one). Returns (returncode_or_None, stdout, stderr, elapsed_s, memory_kb).
+def _run_posix(cmd, stdin, time_limit_s, preexec_fn, cgroup):
+    """Runs cmd, polling with os.wait4 so we get this process's own exit status
+    precisely. If `cgroup` is given, it caps and measures the whole process tree
+    (parent + any subprocesses) and is killed as a unit on timeout; otherwise only
+    the directly spawned process is killed/measured (resource.getrusage(RUSAGE_CHILDREN)
+    would report a running max across all children, not just this one, so wait4's own
+    rusage is used instead). Returns (returncode_or_None, stdout, stderr, elapsed_s, memory_kb).
     None returncode means the process was killed for exceeding time_limit_s.
     """
     with tempfile.TemporaryFile(mode="w+") as stdout_f, tempfile.TemporaryFile(mode="w+") as stderr_f:
@@ -73,7 +156,10 @@ def _run_posix(cmd, stdin, time_limit_s, preexec_fn):
             if reaped_pid == proc.pid:
                 break
             if time.perf_counter() > deadline:
-                proc.kill()
+                if cgroup is not None:
+                    cgroup.kill()
+                else:
+                    proc.kill()
                 os.wait4(proc.pid, 0)
                 elapsed = time.perf_counter() - start
                 return None, None, None, elapsed, None
@@ -82,11 +168,14 @@ def _run_posix(cmd, stdin, time_limit_s, preexec_fn):
         returncode = os.waitstatus_to_exitcode(status)
         stdout_f.seek(0)
         stderr_f.seek(0)
-        return returncode, stdout_f.read(), stderr_f.read(), elapsed, rusage.ru_maxrss
+        memory_kb = cgroup.peak_bytes() // 1024 if cgroup is not None else rusage.ru_maxrss
+        return returncode, stdout_f.read(), stderr_f.read(), elapsed, memory_kb
 
 
-def _run_fallback(cmd, stdin, time_limit_s, preexec_fn):
-    """Non-POSIX fallback: no peak-memory measurement, only timing."""
+def _run_fallback(cmd, stdin, time_limit_s, preexec_fn, cgroup):
+    """Non-POSIX fallback: no peak-memory measurement, only timing. `cgroup` is unused
+    here since cgroup v2 requires Linux.
+    """
     start = time.perf_counter()
     try:
         result = subprocess.run(
@@ -108,16 +197,25 @@ def run_test(task_num, in_path, out_path, tasks_dir=TASKS_DIR, config=None):
     script = task_dir / "solution.py"
     if config is None:
         config = load_config(task_dir)
-    preexec_fn = (
-        _limit_memory(config["memory_limit_mb"])
-        if resource and config.get("memory_limit_mb")
-        else None
-    )
+    memory_limit_mb = config.get("memory_limit_mb")
+    cgroup = _make_cgroup(memory_limit_mb) if memory_limit_mb else None
+    if cgroup is not None:
+        preexec_fn = cgroup.join
+    elif resource and memory_limit_mb:
+        preexec_fn = _limit_memory(memory_limit_mb)
+    else:
+        preexec_fn = None
     expected = out_path.read_text()
     cmd = [sys.executable, str(script)]
     runner = _run_posix if os.name == "posix" else _run_fallback
-    with in_path.open() as stdin:
-        returncode, stdout, stderr, elapsed, memory_kb = runner(cmd, stdin, config["time_limit_s"], preexec_fn)
+    try:
+        with in_path.open() as stdin:
+            returncode, stdout, stderr, elapsed, memory_kb = runner(
+                cmd, stdin, config["time_limit_s"], preexec_fn, cgroup
+            )
+    finally:
+        if cgroup is not None:
+            cgroup.close()
 
     if returncode is None:
         return False, None, expected, f"timed out after {config['time_limit_s']}s", elapsed, memory_kb
