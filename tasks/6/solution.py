@@ -5,23 +5,22 @@ def main():
     m = int(input())
     seq2 = list(map(int, input().split()))
 
-    seq_start_idx = 0
-    seq_end_idx = 0
-    for i in range(n):
-        curr_len = 0
-        for j in range(m):
-            if i + curr_len == n:
-                break
-            if seq1[i + curr_len] != seq2[j]:
-                curr_len = 0
-                continue
-            curr_len += 1
-            if curr_len > seq_end_idx - seq_start_idx:
-                seq_start_idx = i
-                seq_end_idx = i + curr_len
-
-    print(*seq1[seq_start_idx: seq_end_idx])
 
 
+    max_idx = []
+    for left_idx in range(n):
+        idx = []
+        for i in range(left_idx, n):
+            last_idx = idx[-1] + 1 if idx else 0
+            for j in range(last_idx, m):
+                if seq1[i] == seq2[j]:
+                    idx.append(j)
+                    if len(idx) > len(max_idx):
+                        max_idx = idx
+                    break
+
+    print(' '.join(map(str, map(seq2.__getitem__, max_idx))))
+
+# https://coderun.yandex.ru/problem/nop-with-response-recovery
 if __name__ == '__main__':
     main()
